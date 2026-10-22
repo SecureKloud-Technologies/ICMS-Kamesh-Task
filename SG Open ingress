@@ -1,0 +1,37 @@
+import boto3, json
+
+sns = boto3.client('sns')
+ec2 = boto3.client('ec2')
+SNS_TOPIC_ARN = 'arn:aws:sns:ap-south-1:123456789012:sg-open-alert'
+
+def lambda_handler(event, context):
+    detail = event.get('detail', {})
+    params = detail.get('requestParameters', {})
+    user = detail.get('userIdentity', {}).get('arn', 'unknown')
+    group_id = params.get('groupId')
+    perms = params.get('ipPermissions', {}).get('items', [])
+
+    open_rules = []
+    for perm in perms:
+        for r in perm.get('ipRanges', {}).get('items', []):
+            if r.get('cidrIp') == '0.0.0.0/0':
+                open_rules.append(perm)
+        for r in perm.get('ipv6Ranges', {}).get('items', []):
+            if r.get('cidrIpv6') == '::/0':
+                open_rules.append(perm)
+
+    if not open_rules:
+        return {'status': 'no violation'}
+
+    for perm in open_rules:
+        ec2.revoke_security_group_ingress(GroupId=group_id, IpPermissions=[perm])
+
+    message = (f"BLOCKED: User {user} tried to open Security Group {group_id} "
+               f"to 0.0.0.0/0. Rule was auto-reverted.\n\nDetails: "
+               f"{json.dumps(open_rules, indent=2)}")
+
+    sns.publish(TopicArn=SNS_TOPIC_ARN,
+                Subject=f"Security Group violation blocked: {group_id}",
+                Message=message)
+
+    return {'status': 'violation reverted', 'group_id': group_id, 'user': user}
