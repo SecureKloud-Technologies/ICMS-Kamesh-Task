@@ -1,0 +1,28 @@
+import boto3, csv, io, base64
+from datetime import datetime, timezone
+
+iam = boto3.client('iam')
+WARN_DAYS = 75
+FINAL_DAYS = 90
+DEACTIVATE_DAYS = 100
+
+def lambda_handler(event, context):
+    iam.generate_credential_report()
+    report = iam.get_credential_report()
+    csv_text = report['Content'].decode('utf-8')
+    reader = csv.DictReader(io.StringIO(csv_text))
+
+    now = datetime.now(timezone.utc)
+    results = []
+
+    for row in reader:
+        for n in ('1', '2'):
+            if row.get(f'access_key_{n}_active') != 'true':
+                continue
+            rotated = row.get(f'access_key_{n}_last_rotated')
+            if rotated in ('N/A', '', None):
+                continue
+            age_days = (now - datetime.fromisoformat(rotated)).days
+            results.append({'user': row['user'], 'key_index': n, 'age_days': age_days})
+
+    return results  # handed off to the notify step
