@@ -1,0 +1,58 @@
+import boto3, json
+
+s3 = boto3.client('s3')
+sns = boto3.client('sns')
+SNS_TOPIC_ARN = 'arn:aws:sns:ap-south-1:123456789012:s3-public-alert'
+
+SAFE_CONFIG = {
+    'BlockPublicAcls': True,
+    'IgnorePublicAcls': True,
+    'BlockPublicPolicy': True,
+    'RestrictPublicBuckets': True
+}
+
+def lambda_handler(event, context):
+    detail = event.get('detail', {})
+    event_name = detail.get('eventName')
+    params = detail.get('requestParameters', {})
+    user = detail.get('userIdentity', {}).get('arn', 'unknown')
+    bucket = params.get('bucketName')
+
+    violation = False
+    reason = ""
+
+    if event_name == 'PutBucketPublicAccessBlock':
+        cfg = params.get('PublicAccessBlockConfiguration', {})
+        if not all(cfg.get(k, True) for k in SAFE_CONFIG):
+            violation = True
+            reason = "Block Public Access was weakened on the bucket"
+
+    elif event_name == 'PutBucketPolicy':
+        policy = json.loads(params.get('bucketPolicy', '{}'))
+        for stmt in policy.get('Statement', []):
+            if stmt.get('Effect') == 'Allow' and stmt.get('Principal') == '*':
+                violation = True
+                reason = "Bucket policy grants public access (Principal: *)"
+
+    elif event_name == 'PutBucketAcl':
+        for grant in params.get('AccessControlPolicy', {}).get('AccessControlList', {}).get('Grant', []):
+            uri = grant.get('Grantee', {}).get('URI', '')
+            if 'AllUsers' in uri or 'AuthenticatedUsers' in uri:
+                violation = True
+                reason = "Bucket ACL grants public access"
+
+    if not violation:
+        return {'status': 'no violation'}
+
+    s3.put_public_access_block(Bucket=bucket, PublicAccessBlockConfiguration=SAFE_CONFIG)
+    if event_name == 'PutBucketPolicy':
+        s3.delete_bucket_policy(Bucket=bucket)
+
+    message = (f"BLOCKED: User {user} made bucket {bucket} public via {event_name}.\n"
+               f"Reason: {reason}\nBlock Public Access re-applied automatically.")
+
+    sns.publish(TopicArn=SNS_TOPIC_ARN,
+                Subject=f"S3 public access blocked: {bucket}",
+                Message=message)
+
+    return {'status': 'violation reverted', 'bucket': bucket, 'user': user}
